@@ -82,6 +82,14 @@ public:
 	virtual void SetDebugPath(entity_pos_t, entity_pos_t, const PathGoal&, pass_class_t) override {}
 	virtual bool IsGoalReachable(entity_pos_t, entity_pos_t, const PathGoal&, pass_class_t) override { return false; }
 	virtual std::vector<CFixedVector2D> DistributeAround(std::vector<entity_id_t>, entity_pos_t, entity_pos_t) const override { return {}; }
+	virtual std::vector<CFixedVector2D> ComputeGroupPath(entity_pos_t, entity_pos_t, entity_pos_t, entity_pos_t, const std::string&) const override { return {}; }
+	virtual std::vector<u32> GetPathWidths(std::vector<CFixedVector2D>, const std::string&) const override { return {}; }
+	virtual std::vector<CFixedVector2D> GetPathSideWidths(std::vector<CFixedVector2D>, const std::string&) const override { return {}; }
+	virtual std::vector<u32> GetAndResetPathStats() override { return {0, 0}; }
+	virtual std::vector<CFixedVector2D> GetEntityPositionsBatch(std::vector<entity_id_t>) const override { return {}; }
+	virtual std::vector<CFixedVector2D> ComputeFlowFieldPath(entity_pos_t, entity_pos_t, entity_pos_t, entity_pos_t, const std::string&) override { return {}; }
+	virtual u8 GetFlowDirection(entity_pos_t, entity_pos_t, pass_class_t) const override { return 0; }
+	virtual CFixedVector2D GetSmoothFlowDirection(entity_pos_t, entity_pos_t, pass_class_t) const override { return {}; }
 	virtual bool CheckMovement(const IObstructionTestFilter&, entity_pos_t, entity_pos_t, entity_pos_t, entity_pos_t, entity_pos_t, pass_class_t) const override { return false; }
 	virtual ICmpObstruction::EFoundationCheck CheckUnitPlacement(const IObstructionTestFilter&, entity_pos_t, entity_pos_t, entity_pos_t, pass_class_t, bool = false) const override { return ICmpObstruction::FOUNDATION_CHECK_SUCCESS; }
 	virtual ICmpObstruction::EFoundationCheck CheckBuildingPlacement(const IObstructionTestFilter&, entity_pos_t, entity_pos_t, entity_pos_t, entity_pos_t, entity_pos_t, entity_id_t, pass_class_t) const override { return ICmpObstruction::FOUNDATION_CHECK_SUCCESS; }
