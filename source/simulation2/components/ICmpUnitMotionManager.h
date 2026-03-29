@@ -55,6 +55,18 @@ private:
 	 */
 	virtual bool IsPushingActivated() const = 0;
 
+public:
+	/**
+	 * Set the group movement mode ("classic" or "responsive").
+	 * Called from JS during game initialization.
+	 */
+	virtual void SetGroupMovementMode(const std::string& mode) = 0;
+
+	/**
+	 * @return whether the responsive (SC2-style) movement mode is active.
+	 */
+	virtual bool IsResponsiveMode() const = 0;
+
 };
 
 #endif // INCLUDED_ICMPUNITMOTIONMANAGER

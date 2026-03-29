@@ -819,6 +819,58 @@ UnitAI.prototype.UnitFsmSpec = {
 
 			if (!this.CheckFormationTargetAttackRange(formationTarget || target))
 			{
+				// In responsive mode, use pincer surround for large targets (buildings).
+				// Units split into two halves and flow around opposite sides.
+				const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+				const cmpTargetObstruction = Engine.QueryInterface(target, IID_Obstruction);
+				const targetSize = cmpTargetObstruction ? cmpTargetObstruction.GetSize() : 0;
+				if (cmpGroupMovement && cmpGroupMovement.IsResponsive() && targetSize > 2)
+				{
+					const cmpFormation = Engine.QueryInterface(this.entity, IID_Formation);
+					if (cmpFormation)
+					{
+						const members = cmpFormation.GetMembers();
+						// Compute group center for approach direction.
+						let gx = 0, gz = 0, count = 0;
+						for (const ent of members)
+						{
+							const cmpPos = Engine.QueryInterface(ent, IID_Position);
+							if (cmpPos && cmpPos.IsInWorld())
+							{
+								const p = cmpPos.GetPosition2D();
+								gx += p.x; gz += p.y; ++count;
+							}
+						}
+						if (count > 0)
+						{
+							const groupCenter = { "x": gx / count, "y": gz / count };
+							const surround = cmpGroupMovement.ComputeSurroundPositions(
+								target, members, groupCenter);
+
+							for (const assignment of surround.surround)
+							{
+								const cmpUnitAI = Engine.QueryInterface(assignment.ent, IID_UnitAI);
+								if (cmpUnitAI)
+								{
+									cmpUnitAI.Walk(assignment.x, assignment.z, false, false);
+									cmpUnitAI.Attack(target, msg.data.allowCapture, true, false);
+								}
+							}
+							for (const assignment of surround.guard)
+							{
+								const cmpUnitAI = Engine.QueryInterface(assignment.ent, IID_UnitAI);
+								if (cmpUnitAI)
+								{
+									cmpUnitAI.Walk(assignment.x, assignment.z, false, false);
+									cmpUnitAI.Attack(target, msg.data.allowCapture, true, false);
+								}
+							}
+							this.SetNextState("MEMBER");
+							return ACCEPT_ORDER;
+						}
+					}
+				}
+
 				if (this.AbleToMove() && this.CheckTargetVisible(target))
 				{
 					this.SetNextState("COMBAT.APPROACHING");
@@ -1095,15 +1147,71 @@ UnitAI.prototype.UnitFsmSpec = {
 
 			"MovementUpdate": function(msg)
 			{
-				if (msg.veryObstructed && !this.obstructionMitigationAttempted)
+				const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+				const responsive = cmpGroupMovement && cmpGroupMovement.IsResponsive();
+
+				// In responsive mode, skip the veryObstructed workaround.
+				// Individual units handle their own obstruction via pushing.
+				if (!responsive && msg.veryObstructed && !this.obstructionMitigationAttempted)
 					this.AttemptObstructionMitigation();
+				else if (responsive)
+				{
+					// In responsive mode, also check transitive arrival.
+					const cmpFormation = Engine.QueryInterface(this.entity, IID_Formation);
+					if (cmpFormation)
+						cmpGroupMovement.PropagateArrival(this.entity);
+					if (cmpGroupMovement.AreAllArrived(this.entity) || this.CheckRange(this.order.data))
+					{
+						cmpGroupMovement.ClearGroup(this.entity);
+						this.FinishOrder();
+						return;
+					}
+				}
 				else if (msg.likelyFailure || this.CheckRange(this.order.data))
 					this.FinishOrder();
 			},
 			"Timer": function()
 			{
-				// Update Formation in case some members left.
-				this.RequestFormationUpdate(false, true);
+				const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+				const responsive = cmpGroupMovement && cmpGroupMovement.IsResponsive();
+
+				if (responsive)
+				{
+					// In responsive mode, check for stragglers that fell behind
+					// (stuck, distracted by combat) and re-issue their formation walk.
+					const cmpFormation = Engine.QueryInterface(this.entity, IID_Formation);
+					if (cmpFormation)
+					{
+						const members = cmpFormation.GetMembers();
+						const cmpPosition = Engine.QueryInterface(this.entity, IID_Position);
+						if (cmpPosition && cmpPosition.IsInWorld())
+						{
+							const controllerPos = cmpPosition.GetPosition2D();
+							for (const ent of members)
+							{
+								const cmpMemberPos = Engine.QueryInterface(ent, IID_Position);
+								if (!cmpMemberPos || !cmpMemberPos.IsInWorld())
+									continue;
+								const memberPos = cmpMemberPos.GetPosition2D();
+								const dx = memberPos.x - controllerPos.x;
+								const dy = memberPos.y - controllerPos.y;
+								// If a member is more than 60m behind, re-issue its order.
+								if (dx * dx + dy * dy > 60 * 60)
+								{
+									const cmpUnitAI = Engine.QueryInterface(ent, IID_UnitAI);
+									if (cmpUnitAI && cmpUnitAI.IsIdle())
+										cmpUnitAI.AddOrder("FormationWalk", {
+											"target": this.entity,
+											"x": 0, "z": 0,
+											"offsetsChanged": false
+										}, false);
+								}
+							}
+						}
+					}
+				}
+				else
+					this.RequestFormationUpdate(false, true);
 			}
 		},
 
@@ -1134,12 +1242,33 @@ UnitAI.prototype.UnitFsmSpec = {
 					this.SetNextState("MEMBER");
 
 				Engine.ProfileStop();
+
+				// In responsive mode, don't force recomputation during combat movement.
+				const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+				const responsive = cmpGroupMovement && cmpGroupMovement.IsResponsive();
+				if (!responsive)
+					this.RequestFormationUpdate(true, true, "combat");
 			},
 
 			"MovementUpdate": function(msg)
 			{
-				if (msg.veryObstructed && !this.obstructionMitigationAttempted)
+				const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+				const responsive = cmpGroupMovement && cmpGroupMovement.IsResponsive();
+
+				if (!responsive && msg.veryObstructed && !this.obstructionMitigationAttempted)
 					this.AttemptObstructionMitigation();
+				else if (responsive)
+				{
+					const cmpFormation = Engine.QueryInterface(this.entity, IID_Formation);
+					if (cmpFormation)
+						cmpGroupMovement.PropagateArrival(this.entity);
+					if (cmpGroupMovement.AreAllArrived(this.entity) || this.CheckRange(this.order.data))
+					{
+						cmpGroupMovement.ClearGroup(this.entity);
+						this.FinishOrder();
+						return;
+					}
+				}
 				else if (msg.likelyFailure || this.CheckRange(this.order.data))
 					this.FinishOrder();
 			},
@@ -1193,10 +1322,11 @@ UnitAI.prototype.UnitFsmSpec = {
 
 				"Timer": function(msg)
 				{
-					// Force the units to stick together
-					// TODO : better handling of formation patrolling
-					// See https://gitea.wildfiregames.com/0ad/0ad/issues/8558
-					this.RequestFormationUpdate(true, true, "combat");
+					// In responsive mode, don't force recomputation during patrol.
+					const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+					const responsive = cmpGroupMovement && cmpGroupMovement.IsResponsive();
+					if (!responsive)
+						this.RequestFormationUpdate(true, true, "combat");
 
 					if (this.FindWalkAndFightTargets())
 						this.SetNextState("MEMBER");
@@ -1204,7 +1334,10 @@ UnitAI.prototype.UnitFsmSpec = {
 
 				"MovementUpdate": function(msg)
 				{
-					if (msg.veryObstructed && !this.obstructionMitigationAttempted)
+					const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+					const responsive = cmpGroupMovement && cmpGroupMovement.IsResponsive();
+
+					if (!responsive && msg.veryObstructed && !this.obstructionMitigationAttempted)
 					{
 						this.AttemptObstructionMitigation();
 						return;
@@ -1353,6 +1486,8 @@ UnitAI.prototype.UnitFsmSpec = {
 					const cmpTargetUnitAI = Engine.QueryInterface(target, IID_UnitAI);
 					if (cmpTargetUnitAI && cmpTargetUnitAI.IsFormationMember())
 						target = cmpTargetUnitAI.GetFormationController();
+
+					// Building surround is handled in Order.Attack now (pincer maneuver).
 					const cmpAttack = Engine.QueryInterface(this.entity, IID_Attack);
 					this.CallMemberFunction("Attack", [target, this.order.data.allowCapture, false]);
 					if (cmpAttack.CanAttackAsFormation())
@@ -1561,6 +1696,11 @@ UnitAI.prototype.UnitFsmSpec = {
 			// is done moving. The controller is notified.
 			"MovementUpdate": function(msg)
 			{
+				// In responsive mode, mark this unit as arrived for transitive bumping.
+				const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+				if (cmpGroupMovement && cmpGroupMovement.IsResponsive() && this.formationController)
+					cmpGroupMovement.MarkArrived(this.entity, this.formationController);
+
 				// When walking in formation, we'll only get notified in case of failure
 				// if the formation controller has stopped walking.
 				// Formations can start lagging a lot if many entities request short path

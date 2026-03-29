@@ -81,6 +81,21 @@ function InitGame(settings)
 		}
 	}
 
+	if (settings.GroupMovement)
+	{
+		let cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+		if (cmpGroupMovement)
+			cmpGroupMovement.SetMode(settings.GroupMovement);
+
+		// Also set the mode on the C++ UnitMotionManager for enhanced pushing behavior.
+		if (settings.GroupMovement === "responsive")
+		{
+			let cmpMotionManager = Engine.QueryInterface(SYSTEM_ENTITY, IID_UnitMotionManager);
+			if (cmpMotionManager)
+				cmpMotionManager.SetGroupMovementMode("responsive");
+		}
+	}
+
 	// Update the grid with all entities created for the map init.
 	Engine.QueryInterface(SYSTEM_ENTITY, IID_Pathfinder).UpdateGrid();
 

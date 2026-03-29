@@ -140,6 +140,56 @@ public:
 	virtual std::vector<CFixedVector2D> DistributeAround(std::vector<entity_id_t> units, entity_pos_t x, entity_pos_t z) const = 0;
 
 	/**
+	 * Compute a single long-range path synchronously and return its waypoints.
+	 * Used by the responsive group movement system to share one strategic path
+	 * across an entire group instead of computing N individual paths.
+	 */
+	virtual std::vector<CFixedVector2D> ComputeGroupPath(entity_pos_t x0, entity_pos_t z0, entity_pos_t x1, entity_pos_t z1, const std::string& passClassName) const = 0;
+
+	/**
+	 * For each waypoint in the given path, measure the passable width perpendicular
+	 * to the path direction. Returns widths in meters. Used for chokepoint detection.
+	 */
+	virtual std::vector<u32> GetPathWidths(std::vector<CFixedVector2D> waypoints, const std::string& passClassName) const = 0;
+
+	/**
+	 * For each waypoint, measure passable width on each side (left/right relative to path direction).
+	 * Returns pairs as CFixedVector2D where X = left width, Y = right width (in navcells).
+	 */
+	virtual std::vector<CFixedVector2D> GetPathSideWidths(std::vector<CFixedVector2D> waypoints, const std::string& passClassName) const = 0;
+
+	/**
+	 * Returns {longRequests, shortRequests} counts since last call. Resets counters.
+	 */
+	virtual std::vector<u32> GetAndResetPathStats() = 0;
+
+	/**
+	 * Batch query entity data for surround computation.
+	 * Returns per-entity: {posX, posZ, isCavalry, isRangedOnly, attackRange}
+	 * Encoded as CFixedVector2D where X encodes flags and Y encodes attack range.
+	 * Positions returned in a separate vector.
+	 */
+	virtual std::vector<CFixedVector2D> GetEntityPositionsBatch(std::vector<entity_id_t> entities) const = 0;
+
+	/**
+	 * Request a flow field path. Returns waypoints extracted from flow field tiles.
+	 * Uses portal A* for routing, then generates flow fields per sector.
+	 */
+	virtual std::vector<CFixedVector2D> ComputeFlowFieldPath(entity_pos_t x0, entity_pos_t z0,
+		entity_pos_t x1, entity_pos_t z1, const std::string& passClassName) = 0;
+
+	/**
+	 * Get the flow field direction at a world position.
+	 * Returns 0 (FLOW_NONE) if no flow field is available.
+	 */
+	virtual u8 GetFlowDirection(entity_pos_t worldX, entity_pos_t worldZ, pass_class_t passClass) const = 0;
+
+	/**
+	 * Get smooth (Eikonal) flow direction as a continuous vector.
+	 */
+	virtual CFixedVector2D GetSmoothFlowDirection(entity_pos_t worldX, entity_pos_t worldZ, pass_class_t passClass) const = 0;
+
+	/**
 	 * @return true if the goal is reachable from (x0, z0) for the given passClass, false otherwise.
 	 * Warning: this is synchronous, somewhat expensive and not should not be called too liberally.
 	 */

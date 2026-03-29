@@ -34,6 +34,7 @@
 #include "simulation2/components/ICmpObstruction.h"
 #include "simulation2/components/ICmpObstructionManager.h"
 #include "simulation2/components/ICmpPathfinder.h"
+#include "simulation2/helpers/FlowFieldManager.h"
 #include "simulation2/components/ICmpPosition.h"
 #include "simulation2/components/ICmpUnitMotion.h"
 #include "simulation2/components/ICmpUnitMotionManager.h"
@@ -116,6 +117,12 @@ constexpr u8 KNOWN_IMPERFECT_PATH_RESET_COUNTDOWN = 12;
  * this could probably be lowered.
  */
 constexpr u8 MAX_FAILED_MOVEMENTS = 35;
+
+/**
+ * In responsive (SC2-style) mode, units give up sooner since the pushing system
+ * resolves most deadlocks faster than re-pathing.
+ */
+constexpr u8 MAX_FAILED_MOVEMENTS_RESPONSIVE = 15;
 
 /**
  * When computing paths but failing to move, we want to occasionally alternate pathfinder systems
@@ -731,7 +738,10 @@ private:
 	bool IncrementFailedMovementsAndMaybeNotify()
 	{
 		m_FailedMovements++;
-		if (m_FailedMovements >= MAX_FAILED_MOVEMENTS)
+		CmpPtr<ICmpUnitMotionManager> cmpMotionManager(GetSystemEntity());
+		u8 threshold = (cmpMotionManager && cmpMotionManager->IsResponsiveMode())
+			? MAX_FAILED_MOVEMENTS_RESPONSIVE : MAX_FAILED_MOVEMENTS;
+		if (m_FailedMovements >= threshold)
 		{
 			MoveFailed();
 			m_FailedMovements = 0;
@@ -1093,11 +1103,105 @@ void CCmpUnitMotion::Move(CCmpUnitMotionManager::MotionState& state, fixed dt)
 {
 	PROFILE("Move");
 
-	// If we're chasing a potentially-moving unit and are currently close
-	// enough to its current position, and we can head in a straight line
-	// to it, then throw away our current path and go straight to it.
-	state.wentStraight = TryGoingStraightToTarget(state.initialPos, true);
+	// In responsive mode with ORCA: apply ORCA velocity directly.
+	// Only when the unit is actively moving with a valid preferred velocity.
+	CmpPtr<ICmpUnitMotionManager> cmpMotionManager(GetSystemEntity());
+	if (cmpMotionManager && cmpMotionManager->IsResponsiveMode() &&
+		!state.orcaVelocity.IsZero() && !state.prefVelocity.IsZero() &&
+		state.isMoving && m_MoveRequest.m_Type != MoveRequest::NONE)
+	{
+		// Compute preferred velocity for ORCA (stored for next tick's ORCA phase).
+		// Base direction from flow field, then blend in formation offset correction.
+		CmpPtr<ICmpPathfinder> cmpPf(GetSystemEntity());
+		if (cmpPf)
+		{
+			CFixedVector2D baseDir;
 
+			// Get base flow direction (Eikonal smooth → discrete → waypoint fallback).
+			CFixedVector2D smoothDir = cmpPf->GetSmoothFlowDirection(state.pos.X, state.pos.Y, m_PassClass);
+			if (!smoothDir.IsZero())
+				baseDir = smoothDir;
+			else
+			{
+				u8 flowDir = cmpPf->GetFlowDirection(state.pos.X, state.pos.Y, m_PassClass);
+				if (flowDir != 0)
+				{
+					CFixedVector2D fd = FlowFieldManager::DirectionToVector(flowDir);
+					baseDir = fd;
+				}
+				else if (!m_LongPath.m_Waypoints.empty())
+				{
+					CFixedVector2D wp(m_LongPath.m_Waypoints.back().x, m_LongPath.m_Waypoints.back().z);
+					CFixedVector2D dir = wp - state.pos;
+					fixed len = dir.Length();
+					if (len > fixed::Epsilon())
+						baseDir = CFixedVector2D(dir.X / len, dir.Y / len);
+				}
+				else if (!m_ShortPath.m_Waypoints.empty())
+				{
+					CFixedVector2D wp(m_ShortPath.m_Waypoints.back().x, m_ShortPath.m_Waypoints.back().z);
+					CFixedVector2D dir = wp - state.pos;
+					fixed len = dir.Length();
+					if (len > fixed::Epsilon())
+						baseDir = CFixedVector2D(dir.X / len, dir.Y / len);
+				}
+			}
+
+			// For formation members: blend flow direction with offset correction.
+			// This makes units maintain rough formation shape while flowing.
+			if (IsFormationMember() && m_MoveRequest.m_Type == MoveRequest::OFFSET &&
+				!baseDir.IsZero())
+			{
+				// Compute where this unit should be (controller pos + rotated offset).
+				CFixedVector2D targetPos;
+				if (ComputeTargetPosition(targetPos, m_MoveRequest))
+				{
+					CFixedVector2D toTarget = targetPos - state.pos;
+					fixed dist = toTarget.Length();
+
+					if (dist > Pathfinding::NAVCELL_SIZE * 2)
+					{
+						// Blend: 70% flow direction + 30% correction toward offset position.
+						CFixedVector2D correction(toTarget.X / dist, toTarget.Y / dist);
+						baseDir.X = baseDir.X.Multiply(fixed::FromFraction(7, 10)) +
+							correction.X.Multiply(fixed::FromFraction(3, 10));
+						baseDir.Y = baseDir.Y.Multiply(fixed::FromFraction(7, 10)) +
+							correction.Y.Multiply(fixed::FromFraction(3, 10));
+
+						// Re-normalize.
+						fixed blen = baseDir.Length();
+						if (blen > fixed::Epsilon())
+						{
+							baseDir.X = baseDir.X / blen;
+							baseDir.Y = baseDir.Y / blen;
+						}
+					}
+					else
+					{
+						// Close enough to offset — just follow the flow.
+					}
+				}
+			}
+
+			state.prefVelocity = CFixedVector2D(
+				baseDir.X.Multiply(m_Speed), baseDir.Y.Multiply(m_Speed));
+		}
+
+		// Apply ORCA velocity.
+		state.pos.X = state.pos.X + state.orcaVelocity.X.Multiply(dt);
+		state.pos.Y = state.pos.Y + state.orcaVelocity.Y.Multiply(dt);
+
+		if (!state.orcaVelocity.IsZero())
+			state.angle = atan2_approx(state.orcaVelocity.X, state.orcaVelocity.Y);
+		state.speed = state.orcaVelocity.Length();
+		state.wentStraight = true;
+		state.wasObstructed = false;
+
+		return;
+	}
+
+	// Classic mode / fallback: waypoint following with collision checking.
+	state.wentStraight = TryGoingStraightToTarget(state.initialPos, true);
 	state.wasObstructed = PerformMove(dt, state.cmpPosition->GetTurnRate(), m_ShortPath, m_LongPath, state.pos, state.speed, state.angle, state.pushingPressure);
 }
 
@@ -1817,6 +1921,33 @@ void CCmpUnitMotion::ComputePathToGoal(const CFixedVector2D& from, const PathGoa
 		return;
 	}
 #endif
+
+	// In responsive mode, skip JPS for formation members (they follow the controller)
+	// and for any unit with flow field coverage at their position.
+	{
+		CmpPtr<ICmpUnitMotionManager> cmpMotionManager(GetSystemEntity());
+		if (cmpMotionManager && cmpMotionManager->IsResponsiveMode())
+		{
+			// Formation members always skip JPS — the controller has the strategic path.
+			bool skipJPS = IsFormationMember() && m_MoveRequest.m_Type == MoveRequest::OFFSET;
+
+			// Others: skip JPS only if flow field covers this position.
+			if (!skipJPS)
+			{
+				CmpPtr<ICmpPathfinder> cmpPf(GetSystemEntity());
+				CFixedVector2D curPos = CmpPtr<ICmpPosition>(GetSimContext(), GetEntityId())->GetPosition2D();
+				skipJPS = cmpPf && cmpPf->GetFlowDirection(curPos.X, curPos.Y, m_PassClass) != 0;
+			}
+
+			if (skipJPS)
+			{
+				m_LongPath.m_Waypoints.clear();
+				RequestShortPath(from, goal, true);
+				return;
+			}
+			// No flow field — fall through to JPS for this unit.
+		}
+	}
 
 	// If the target is close enough, hope that we'll be able to go straight next turn.
 	if (!ShouldAlternatePathfinder() && TryGoingStraightToTarget(from, false))

@@ -94,6 +94,7 @@ void CCmpPathfinder::Init(const CParamNode&)
 		m_VertexPathfinders.emplace_back(m_GridSize, m_TerrainOnlyGrid);
 	m_LongPathfinder = std::make_unique<LongPathfinder>();
 	m_PathfinderHier = std::make_unique<HierarchicalPathfinder>();
+	m_FlowFieldManager = std::make_unique<FlowFieldManager>();
 
 	// Set up one future for each worker thread.
 	m_Futures.resize(workerThreads);
@@ -589,11 +590,20 @@ void CCmpPathfinder::UpdateGrid()
 		GetPassabilityClasses(nonPathfindingPassClasses, pathfindingPassClasses);
 		m_LongPathfinder->Reload(m_Grid);
 		m_PathfinderHier->Recompute(m_Grid, nonPathfindingPassClasses, pathfindingPassClasses);
+
+		// Initialize flow field manager with the default passability class.
+		if (!m_PassClassMasks.empty())
+			m_FlowFieldManager->Init(m_GridSize, *m_Grid, m_PassClassMasks.begin()->second);
 	}
 	else
 	{
 		m_LongPathfinder->Update(m_Grid);
 		m_PathfinderHier->Update(m_Grid, m_DirtinessInformation.dirtinessGrid);
+
+		// Update dirty flow field sectors.
+		if (!m_PassClassMasks.empty())
+			m_FlowFieldManager->UpdateDirtySectors(*m_Grid, m_PassClassMasks.begin()->second,
+				m_DirtinessInformation);
 	}
 
 	// Remember the necessary updates that the AI pathfinder will have to perform as well
@@ -765,6 +775,7 @@ void CCmpPathfinder::TerrainUpdateHelper(bool expandPassability, int itile0, int
 
 u32 CCmpPathfinder::ComputePathAsync(entity_pos_t x0, entity_pos_t z0, const PathGoal& goal, pass_class_t passClass, entity_id_t notify)
 {
+	++m_LongPathCount;
 	LongPathRequest req = { m_NextAsyncTicket++, x0, z0, goal, passClass, notify };
 	m_LongPathRequests.m_Requests.push_back(req);
 	return req.ticket;
@@ -774,9 +785,18 @@ u32 CCmpPathfinder::ComputeShortPathAsync(entity_pos_t x0, entity_pos_t z0, enti
                                           const PathGoal& goal, pass_class_t passClass, bool avoidMovingUnits,
                                           entity_id_t group, entity_id_t notify)
 {
+	++m_ShortPathCount;
 	ShortPathRequest req = { m_NextAsyncTicket++, x0, z0, clearance, range, goal, passClass, avoidMovingUnits, group, notify };
 	m_ShortPathRequests.m_Requests.push_back(req);
 	return req.ticket;
+}
+
+std::vector<u32> CCmpPathfinder::GetAndResetPathStats()
+{
+	std::vector<u32> stats = { m_LongPathCount, m_ShortPathCount };
+	m_LongPathCount = 0;
+	m_ShortPathCount = 0;
+	return stats;
 }
 
 void CCmpPathfinder::ComputePathImmediate(entity_pos_t x0, entity_pos_t z0, const PathGoal& goal, pass_class_t passClass, WaypointPath& ret) const
@@ -966,6 +986,238 @@ std::vector<CFixedVector2D> CCmpPathfinder::DistributeAround(std::vector<entity_
 	} while (improved);
 
 	return positions;
+}
+
+std::vector<CFixedVector2D> CCmpPathfinder::ComputeGroupPath(entity_pos_t x0, entity_pos_t z0, entity_pos_t x1, entity_pos_t z1, const std::string& passClassName) const
+{
+	PROFILE2("ComputeGroupPath");
+
+	std::vector<CFixedVector2D> result;
+
+	pass_class_t passClass = GetPassabilityClass(passClassName);
+	if (!passClass)
+		return result;
+
+	PathGoal goal;
+	goal.type = PathGoal::POINT;
+	goal.x = x1;
+	goal.z = z1;
+
+	WaypointPath path;
+	ComputePathImmediate(x0, z0, goal, passClass, path);
+
+	result.reserve(path.m_Waypoints.size());
+	for (const Waypoint& wp : path.m_Waypoints)
+		result.emplace_back(wp.x, wp.z);
+
+	return result;
+}
+
+std::vector<u32> CCmpPathfinder::GetPathWidths(std::vector<CFixedVector2D> waypoints, const std::string& passClassName) const
+{
+	PROFILE2("GetPathWidths");
+
+	std::vector<u32> widths;
+	if (waypoints.size() < 2)
+		return widths;
+
+	pass_class_t passClass = GetPassabilityClass(passClassName);
+	if (!passClass)
+		return widths;
+
+	const Grid<NavcellData>& grid = *m_Grid;
+	u16 gridW = grid.m_W;
+	u16 gridH = grid.m_H;
+
+	widths.reserve(waypoints.size());
+
+	for (size_t i = 0; i < waypoints.size(); ++i)
+	{
+		// Compute direction to next (or from previous) waypoint for perpendicular.
+		CFixedVector2D dir;
+		if (i + 1 < waypoints.size())
+			dir = waypoints[i + 1] - waypoints[i];
+		else
+			dir = waypoints[i] - waypoints[i - 1];
+
+		// Perpendicular direction (rotate 90 degrees).
+		CFixedVector2D perp(-dir.Y, dir.X);
+		fixed perpLen = perp.Length();
+		if (perpLen < fixed::Epsilon())
+		{
+			widths.push_back(0);
+			continue;
+		}
+		// Normalize to 1 navcell step.
+		CFixedVector2D step;
+		step.X = perp.X / perpLen;
+		step.Y = perp.Y / perpLen;
+
+		// Probe outward in both directions from the waypoint, counting passable navcells.
+		u32 width = 1; // The waypoint itself.
+		for (int sign = -1; sign <= 1; sign += 2)
+		{
+			for (u32 d = 1; d < 100; ++d) // Max 100 navcells (~100m).
+			{
+				fixed px = waypoints[i].X + step.X * (int)(sign * d);
+				fixed pz = waypoints[i].Y + step.Y * (int)(sign * d);
+
+				u16 ni, nj;
+				Pathfinding::NearestNavcell(px, pz, ni, nj, gridW, gridH);
+
+				if (!IS_PASSABLE(grid.get(ni, nj), passClass))
+					break;
+				++width;
+			}
+		}
+		widths.push_back(width);
+	}
+
+	return widths;
+}
+
+std::vector<CFixedVector2D> CCmpPathfinder::GetPathSideWidths(std::vector<CFixedVector2D> waypoints, const std::string& passClassName) const
+{
+	PROFILE2("GetPathSideWidths");
+
+	std::vector<CFixedVector2D> sideWidths;
+	if (waypoints.size() < 2)
+		return sideWidths;
+
+	pass_class_t passClass = GetPassabilityClass(passClassName);
+	if (!passClass)
+		return sideWidths;
+
+	const Grid<NavcellData>& grid = *m_Grid;
+	u16 gridW = grid.m_W;
+	u16 gridH = grid.m_H;
+
+	sideWidths.reserve(waypoints.size());
+
+	for (size_t i = 0; i < waypoints.size(); ++i)
+	{
+		CFixedVector2D dir;
+		if (i + 1 < waypoints.size())
+			dir = waypoints[i + 1] - waypoints[i];
+		else
+			dir = waypoints[i] - waypoints[i - 1];
+
+		// Perpendicular: left is (-dir.Y, dir.X), right is (dir.Y, -dir.X)
+		CFixedVector2D perp(-dir.Y, dir.X);
+		fixed perpLen = perp.Length();
+		if (perpLen < fixed::Epsilon())
+		{
+			sideWidths.emplace_back(fixed::Zero(), fixed::Zero());
+			continue;
+		}
+		CFixedVector2D step(perp.X / perpLen, perp.Y / perpLen);
+
+		// Probe left (positive perpendicular direction)
+		u32 leftWidth = 0;
+		for (u32 d = 1; d < 100; ++d)
+		{
+			fixed px = waypoints[i].X + step.X * (int)d;
+			fixed pz = waypoints[i].Y + step.Y * (int)d;
+			u16 ni, nj;
+			Pathfinding::NearestNavcell(px, pz, ni, nj, gridW, gridH);
+			if (!IS_PASSABLE(grid.get(ni, nj), passClass))
+				break;
+			++leftWidth;
+		}
+
+		// Probe right (negative perpendicular direction)
+		u32 rightWidth = 0;
+		for (u32 d = 1; d < 100; ++d)
+		{
+			fixed px = waypoints[i].X - step.X * (int)d;
+			fixed pz = waypoints[i].Y - step.Y * (int)d;
+			u16 ni, nj;
+			Pathfinding::NearestNavcell(px, pz, ni, nj, gridW, gridH);
+			if (!IS_PASSABLE(grid.get(ni, nj), passClass))
+				break;
+			++rightWidth;
+		}
+
+		sideWidths.emplace_back(fixed::FromInt(leftWidth), fixed::FromInt(rightWidth));
+	}
+
+	return sideWidths;
+}
+
+std::vector<CFixedVector2D> CCmpPathfinder::ComputeFlowFieldPath(entity_pos_t x0, entity_pos_t z0,
+	entity_pos_t x1, entity_pos_t z1, const std::string& passClassName)
+{
+	PROFILE2("ComputeFlowFieldPath");
+
+	std::vector<CFixedVector2D> waypoints;
+
+	pass_class_t passClass = GetPassabilityClass(passClassName);
+	if (!passClass || !m_FlowFieldManager)
+		return waypoints;
+
+	CFixedVector2D start(x0, z0);
+	CFixedVector2D goal(x1, z1);
+
+	// Step 1: Portal A* to find which sectors the path crosses.
+	std::vector<u32> portalPath = m_FlowFieldManager->FindPortalPath(start, goal, passClass);
+
+	// Step 2: Generate flow fields for each sector on the path.
+	// Goal sector: use actual target as goal cell.
+	u16 goalSX = (x1 / Pathfinding::NAVCELL_SIZE).ToInt_RoundToZero() / SECTOR_SIZE;
+	u16 goalSY = (z1 / Pathfinding::NAVCELL_SIZE).ToInt_RoundToZero() / SECTOR_SIZE;
+	u16 goalCX = (x1 / Pathfinding::NAVCELL_SIZE).ToInt_RoundToZero() % SECTOR_SIZE;
+	u16 goalCY = (z1 / Pathfinding::NAVCELL_SIZE).ToInt_RoundToZero() % SECTOR_SIZE;
+
+	m_FlowFieldManager->GenerateFlowFieldEikonal(goalSX, goalSY,
+		{{goalCX, goalCY}}, passClass, 0);
+
+	// Transit sectors: use portal entry cells as goals.
+	for (size_t i = 0; i < portalPath.size(); ++i)
+	{
+		const Portal& portal = m_FlowFieldManager->GetPortals()[portalPath[i]];
+
+		// Generate flow field for both sectors of this portal.
+		u16 midCell = (portal.startCell + portal.endCell) / 2;
+		std::vector<std::pair<u16, u16>> portalGoalCells;
+		for (u16 c = portal.startCell; c <= portal.endCell; ++c)
+		{
+			if (portal.side == Portal::EAST || portal.side == Portal::WEST)
+				portalGoalCells.push_back({portal.side == Portal::EAST ? 0 : (SECTOR_SIZE - 1), c});
+			else
+				portalGoalCells.push_back({c, portal.side == Portal::SOUTH ? 0 : (SECTOR_SIZE - 1)});
+		}
+
+		m_FlowFieldManager->GenerateFlowFieldEikonal(portal.sectorAx, portal.sectorAy,
+			portalGoalCells, passClass, portal.id);
+		m_FlowFieldManager->GenerateFlowFieldEikonal(portal.sectorBx, portal.sectorBy,
+			portalGoalCells, passClass, portal.id);
+	}
+
+	// Step 3: Extract waypoints by tracing the flow field from start to goal.
+	// For now, return portal centers as waypoints (simple but effective).
+	for (u32 pid : portalPath)
+		waypoints.push_back(m_FlowFieldManager->GetPortals()[pid].centerPos);
+
+	waypoints.emplace_back(x1, z1); // Final destination.
+	return waypoints;
+}
+
+std::vector<CFixedVector2D> CCmpPathfinder::GetEntityPositionsBatch(std::vector<entity_id_t> entities) const
+{
+	std::vector<CFixedVector2D> result;
+	result.reserve(entities.size());
+
+	for (entity_id_t ent : entities)
+	{
+		CmpPtr<ICmpPosition> cmpPos(GetSimContext(), ent);
+		if (!cmpPos || !cmpPos->IsInWorld())
+		{
+			result.emplace_back(fixed::Zero(), fixed::Zero());
+			continue;
+		}
+		result.push_back(cmpPos->GetPosition2D());
+	}
+	return result;
 }
 
 bool CCmpPathfinder::CheckMovement(const IObstructionTestFilter& filter,

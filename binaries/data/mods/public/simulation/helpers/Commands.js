@@ -173,7 +173,86 @@ var g_Commands = {
 
 	"attack": function(player, cmd, data)
 	{
-		GetFormationUnitAIs(data.entities, player, cmd, data.formation).forEach(cmpUnitAI =>
+		const uais = GetFormationUnitAIs(data.entities, player, cmd, data.formation);
+
+		// In responsive mode, use pincer surround for large targets (buildings).
+		const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+		if (cmpGroupMovement && cmpGroupMovement.IsResponsive() && uais.length > 1 && uais.length === data.entities.length)
+		{
+			const cmpTargetObstruction = Engine.QueryInterface(cmd.target, IID_Obstruction);
+			const targetSize = cmpTargetObstruction ? cmpTargetObstruction.GetSize() : 0;
+			if (targetSize > 2)
+			{
+				// Compute group center.
+				let gx = 0, gz = 0, count = 0;
+				for (const ent of data.entities)
+				{
+					const cmpPos = Engine.QueryInterface(ent, IID_Position);
+					if (cmpPos && cmpPos.IsInWorld())
+					{
+						const p = cmpPos.GetPosition2D();
+						gx += p.x; gz += p.y; ++count;
+					}
+				}
+				if (count > 0)
+				{
+					const groupCenter = { "x": gx / count, "y": gz / count };
+					const surround = cmpGroupMovement.ComputeSurroundPositions(
+						cmd.target, data.entities, groupCenter);
+
+					// Melee: walk to inner ring, then attack.
+					for (const a of surround.melee)
+					{
+						const cmpUnitAI = Engine.QueryInterface(a.ent, IID_UnitAI);
+						if (cmpUnitAI)
+						{
+							cmpUnitAI.Walk(a.x, a.z, cmd.queued, cmd.pushFront);
+							cmpUnitAI.Attack(cmd.target, cmd.allowCapture, true, false);
+						}
+					}
+					// Ranged: walk to outer ring, then attack from range.
+					for (const a of surround.ranged)
+					{
+						const cmpUnitAI = Engine.QueryInterface(a.ent, IID_UnitAI);
+						if (cmpUnitAI)
+						{
+							cmpUnitAI.Walk(a.x, a.z, cmd.queued, cmd.pushFront);
+							cmpUnitAI.Attack(cmd.target, cmd.allowCapture, true, false);
+						}
+					}
+					// Cavalry: patrol circuit around the building.
+					if (surround.buildingPos)
+					{
+						const bp = surround.buildingPos;
+						for (const cav of surround.cavalry)
+						{
+							const cmpUnitAI = Engine.QueryInterface(cav.ent, IID_UnitAI);
+							if (!cmpUnitAI) continue;
+							for (let i = 0; i < 6; ++i)
+							{
+								const angle = cav.startAngle + (i / 6) * 2 * Math.PI;
+								const px = bp.x + Math.cos(angle) * cav.patrolRadius;
+								const pz = bp.y + Math.sin(angle) * cav.patrolRadius;
+								cmpUnitAI.Patrol(px, pz, undefined, false, i > 0);
+							}
+						}
+					}
+					// Guard: walk to outer ring, standground.
+					for (const a of surround.guard)
+					{
+						const cmpUnitAI = Engine.QueryInterface(a.ent, IID_UnitAI);
+						if (cmpUnitAI)
+						{
+							cmpUnitAI.Walk(a.x, a.z, cmd.queued, cmd.pushFront);
+							cmpUnitAI.SwitchToStance("standground");
+						}
+					}
+					return;
+				}
+			}
+		}
+
+		uais.forEach(cmpUnitAI =>
 		{
 			cmpUnitAI.Attack(cmd.target, cmd.allowCapture, cmd.queued, cmd.pushFront);
 		});

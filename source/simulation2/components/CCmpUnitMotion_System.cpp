@@ -31,6 +31,9 @@
 #include "simulation2/components/CCmpUnitMotionManager.h"
 #include "simulation2/components/ICmpObstructionManager.h"
 #include "simulation2/components/ICmpPathfinder.h"
+#include "simulation2/helpers/FlowFieldManager.h"
+#include "simulation2/helpers/OrcaSolver.h"
+#include "simulation2/components/ICmpPathfinder.h"
 #include "simulation2/components/ICmpPosition.h"
 #include "simulation2/components/ICmpTerrain.h"
 #include "simulation2/components/ICmpUnitMotion.h"
@@ -340,6 +343,7 @@ struct SerializeHelper<EntityMap<CCmpUnitMotionManager::MotionState>>
 
 void CCmpUnitMotionManager::Serialize(ISerializer& serialize)
 {
+	serialize.StringASCII("group movement mode", m_GroupMovementMode, 0, 32);
 	Serializer(serialize, "m_Units", m_Units);
 	Serializer(serialize, "m_FormationControllers", m_FormationControllers);
 }
@@ -348,6 +352,7 @@ void CCmpUnitMotionManager::Deserialize(const CParamNode& paramNode, IDeserializ
 {
 	Init(paramNode);
 	ResetSubdivisions();
+	deserialize.StringASCII("group movement mode", m_GroupMovementMode, 0, 32);
 	Serializer(deserialize, "m_Units", m_Units);
 	Serializer(deserialize, "m_FormationControllers", m_FormationControllers);
 }
@@ -501,7 +506,88 @@ void CCmpUnitMotionManager::Move(EntityMap<MotionState>& ents, fixed dt)
 		}
 	}
 
-	// Skip pushing entirely if the radius is 0
+	// In responsive mode, use ORCA for moving units + classic pushing for stationary units.
+	// This ensures attacking/idle units still get separated and don't stack.
+	if (&ents == &m_Units && IsPushingActivated() && IsResponsiveMode())
+	{
+		PROFILE2("MotionMgr_ORCA");
+		for (std::vector<EntityMap<MotionState>::iterator>* vec : assigned)
+		{
+			ENSURE(!vec->empty());
+
+			// Collect neighbors from this cell + 4 cardinal neighbors.
+			std::vector< std::vector<EntityMap<MotionState>::iterator>* > consider = { vec };
+			int x = (*vec)[0]->second.pos.X.ToInt_RoundToZero() / PUSHING_GRID_SIZE;
+			int z = (*vec)[0]->second.pos.Y.ToInt_RoundToZero() / PUSHING_GRID_SIZE;
+			if (x + 1 < m_MovingUnits.width()) consider.push_back(&m_MovingUnits.get(x + 1, z));
+			if (x > 0) consider.push_back(&m_MovingUnits.get(x - 1, z));
+			if (z + 1 < m_MovingUnits.height()) consider.push_back(&m_MovingUnits.get(x, z + 1));
+			if (z > 0) consider.push_back(&m_MovingUnits.get(x, z - 1));
+
+			for (EntityMap<MotionState>::iterator& it : *vec)
+			{
+				// Only use ORCA for units with a preferred velocity (from flow field
+				// or formation). Units moving individually (e.g., to attack targets)
+				// use classic pushing to stay separated at the convergence point.
+				if (it->second.ignore || !it->second.isMoving || it->second.prefVelocity.IsZero())
+					continue;
+
+				// Build ORCA agent for this unit.
+				OrcaAgent agent;
+				agent.position = it->second.pos;
+				CFixedVector2D posDiff = it->second.pos - it->second.initialPos;
+				agent.velocity = CFixedVector2D(posDiff.X / dt, posDiff.Y / dt);
+				// Use a larger radius than physical clearance so ORCA maintains natural spacing.
+				// Classic pushing keeps units ~2-3m apart; match that with ORCA.
+				agent.radius = it->second.cmpUnitMotion->m_Clearance.Multiply(m_PushingRadiusMultiplier);
+				agent.maxSpeed = it->second.speed > fixed::Zero() ? it->second.speed : it->second.cmpUnitMotion->GetWalkSpeed();
+
+				// Preferred velocity: direction toward goal * speed.
+				agent.prefVelocity = it->second.prefVelocity;
+				if (agent.prefVelocity.IsZero() && it->second.isMoving)
+				{
+					// Fallback: use current velocity as preferred.
+					agent.prefVelocity = agent.velocity;
+				}
+
+				// Collect K nearest neighbors as ORCA agents.
+				std::vector<const OrcaAgent*> neighbors;
+				std::vector<OrcaAgent> neighborAgents;
+				neighborAgents.reserve(ORCA_MAX_NEIGHBORS);
+
+				entity_pos_t neighborDistSq = entity_pos_t::FromInt(ORCA_NEIGHBOR_DIST).Multiply(entity_pos_t::FromInt(ORCA_NEIGHBOR_DIST));
+
+				for (std::vector<EntityMap<MotionState>::iterator>* vec2 : consider)
+				{
+					for (EntityMap<MotionState>::iterator& it2 : *vec2)
+					{
+						if (it->first == it2->first || it2->second.ignore)
+							continue;
+						CFixedVector2D diff = it2->second.pos - it->second.pos;
+						if (diff.Dot(diff) > neighborDistSq)
+							continue;
+						if (neighborAgents.size() >= ORCA_MAX_NEIGHBORS)
+							break;
+
+						OrcaAgent na;
+						na.position = it2->second.pos;
+						CFixedVector2D nd = it2->second.pos - it2->second.initialPos;
+						na.velocity = CFixedVector2D(nd.X / dt, nd.Y / dt);
+						na.radius = it2->second.cmpUnitMotion->m_Clearance.Multiply(m_PushingRadiusMultiplier);
+						na.maxSpeed = it2->second.speed;
+						neighborAgents.push_back(na);
+					}
+				}
+				for (const auto& na : neighborAgents)
+					neighbors.push_back(&na);
+
+				// Solve ORCA.
+				it->second.orcaVelocity = OrcaSolver::ComputeNewVelocity(agent, neighbors, dt);
+				it->second.needUpdate = true;
+			}
+		}
+	}
+	// Run pushing for stationary units (responsive mode) or ALL units (classic mode).
 	if (&ents == &m_Units && IsPushingActivated())
 	{
 		PROFILE2("MotionMgr_Pushing");
@@ -560,6 +646,12 @@ void CCmpUnitMotionManager::Move(EntityMap<MotionState>& ents, fixed dt)
 					for (EntityMap<MotionState>::iterator& it2 : *vec2)
 						if (it->first < it2->first && !it2->second.ignore)
 						{
+							// In responsive mode, skip pairs where both have ORCA
+							// (non-zero prefVelocity = flow field / formation movement).
+							// All other pairs use classic pushing.
+							if (IsResponsiveMode() &&
+								!it->second.prefVelocity.IsZero() && !it2->second.prefVelocity.IsZero())
+								continue;
 #if DEBUG_STATS
 							++comparisons;
 #endif
@@ -680,10 +772,23 @@ void CCmpUnitMotionManager::Push(EntityMap<MotionState>::value_type& a, EntityMa
 	// and are also allowed to push idle units (obstructions are ignored within formations,
 	// so pushing idle units makes one member crossing the formation look better).
 	bool sameControlGroup = a.second.controlGroup != INVALID_ENTITY && a.second.controlGroup == b.second.controlGroup;
-	if (sameControlGroup)
+
+	// In responsive mode, allow formation members to push each other more freely
+	// but ONLY when at least one is moving. When both are stationary (attacking,
+	// idle in close order), use classic restricted push to maintain proper spacing.
+	if (sameControlGroup && !IsResponsiveMode())
 		movingPush = 0;
+	else if (sameControlGroup && movingPush > 0)
+		movingPush = 2; // At least one moving: treat as both-moving.
+	else if (sameControlGroup)
+		movingPush = 0; // Both stationary: classic restricted push.
 
 	if (movingPush == 1)
+		return;
+
+	// Responsive mode: stationary units resist pushing more strongly.
+	// This prevents moving allies from displacing units that are attacking or garrisoning.
+	if (IsResponsiveMode() && !a.second.isMoving && !b.second.isMoving && !sameControlGroup)
 		return;
 
 	entity_pos_t combinedClearance = (a.second.cmpUnitMotion->m_Clearance + b.second.cmpUnitMotion->m_Clearance).Multiply(PUSHING_CORRECTION);
@@ -739,8 +844,10 @@ void CCmpUnitMotionManager::Push(EntityMap<MotionState>::value_type& a, EntityMa
 		if (offsetLength > entity_pos_t::Epsilon() * 10)
 		{
 			// This needs to be a strong effect or it won't really work.
-			offset.X = offset.X / offsetLength * 3;
-			offset.Y = offset.Y / offsetLength * 3;
+			// In responsive mode, use a stronger nudge for better avoidance.
+			int nudgeStrength = IsResponsiveMode() ? 5 : 3;
+			offset.X = offset.X / offsetLength * nudgeStrength;
+			offset.Y = offset.Y / offsetLength * nudgeStrength;
 		}
 		offsetLength = entity_pos_t::Zero();
 	}

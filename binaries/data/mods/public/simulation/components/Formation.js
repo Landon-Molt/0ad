@@ -503,6 +503,14 @@ Formation.prototype.ArrangeFormation = function(moveCenter, force, variant)
 	if (!this.members.length)
 		return;
 
+	// In responsive mode, use the SC2-style movement system.
+	const cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+	if (cmpGroupMovement && cmpGroupMovement.IsResponsive())
+	{
+		this.MoveMembersResponsive(moveCenter, force, variant);
+		return;
+	}
+
 	const active = [];
 	const positions = [];
 
@@ -1204,5 +1212,173 @@ Formation.prototype.OnEntityRenamed = function(msg)
  * Unsorted members are generally placed at the back/last of the formation.
  */
 Formation.prototype.UNSORTED_CLASS_COMBINATION = "Unsorted";
+
+/**
+ * SC2-style responsive movement. Units move immediately with SmartCenter clustering.
+ * Uses consistent offsets throughout — no phase switching that causes visible retightening.
+ */
+Formation.prototype.MoveMembersResponsive = function(moveCenter, force, variant)
+{
+	if (!this.members.length)
+		return;
+
+	let active = [];
+	let positions = [];
+
+	for (let ent of this.members)
+	{
+		let cmpPosition = Engine.QueryInterface(ent, IID_Position);
+		if (!cmpPosition || !cmpPosition.IsInWorld())
+			continue;
+		active.push(ent);
+		positions.push(cmpPosition.GetPosition2D());
+	}
+
+	if (!active.length)
+		return;
+
+	let cmpGroupMovement = Engine.QueryInterface(SYSTEM_ENTITY, IID_GroupMovementManager);
+	let cmpFormationUnitAI = Engine.QueryInterface(this.entity, IID_UnitAI);
+	let cmpPosition = Engine.QueryInterface(this.entity, IID_Position);
+
+	// Reposition formation controller.
+	if (cmpPosition && (moveCenter || !cmpPosition.IsInWorld()))
+	{
+		let avgpos = Vector2D.average(positions);
+		let targetPositions = cmpFormationUnitAI.GetTargetPositions();
+		let targetPosition = targetPositions.length ? targetPositions[0] : undefined;
+
+		// In responsive mode, when the controller is already in the world, don't snap
+		// back to the group average — that causes front units to turn backward.
+		// Instead, keep the controller at the leading edge (biased toward the target).
+		if (cmpPosition.IsInWorld() && targetPosition !== undefined)
+		{
+			let dx = targetPosition.x - avgpos.x;
+			let dy = targetPosition.y - avgpos.y;
+			let dist = Math.sqrt(dx * dx + dy * dy);
+			if (dist > 1)
+			{
+				// Shift the center 30% toward the target from the average.
+				avgpos.x += dx * 0.3;
+				avgpos.y += dy * 0.3;
+			}
+		}
+
+		let oldRotation = cmpPosition.GetRotation().y;
+		let newRotation = targetPosition !== undefined && avgpos.distanceToSquared(targetPosition) > g_RotateDistanceThreshold ?
+			avgpos.angleTo(targetPosition) : oldRotation;
+
+		this.SetupPositionAndHandleRotation(avgpos.x, avgpos.y, newRotation, true);
+	}
+
+	// Compute SmartCenter for group classification.
+	let sc = cmpGroupMovement.ComputeSmartCenter(positions);
+
+	// Get target for scattered mode's DistributeAround.
+	let targetPositions = cmpFormationUnitAI.GetTargetPositions();
+	let target = targetPositions.length ? targetPositions[0] : undefined;
+
+	// Register group for transitive bumping.
+	cmpGroupMovement.RegisterGroup(this.entity, active);
+
+	// On new move commands, compute one shared strategic path for the entire group.
+	if (force && target)
+	{
+		let avgpos = Vector2D.average(positions);
+		let cmpUnitMotion = Engine.QueryInterface(active[0], IID_UnitMotion);
+		let passClassName = cmpUnitMotion ? cmpUnitMotion.GetPassabilityClassName() : "default";
+		cmpGroupMovement.ComputeSharedPath(this.entity, avgpos.x, avgpos.y, target.x, target.y, passClassName);
+		// Shift path waypoints away from obstacles at corners.
+		cmpGroupMovement.AdjustPathForObstacles(this.entity, sc.sigma, passClassName);
+	}
+
+	this.lastOrderVariant = variant;
+
+	if (force)
+		this.ResetFinishedEntities();
+
+	// Only recompute offsets when they don't exist (first call) or when forced (new move command).
+	// This prevents the idle timer from constantly reshuffling settled units.
+	let offsetsChanged = false;
+	if (!this.offsets || force)
+	{
+		if (sc.mode === "scattered" && target)
+		{
+			// SCATTERED: use DistributeAround to spread units in a spiral around the target.
+			let cmpPathfinder = Engine.QueryInterface(SYSTEM_ENTITY, IID_Pathfinder);
+			let distributed = cmpPathfinder.DistributeAround(active, target.x, target.y);
+			this.offsets = [];
+			for (let i = 0; i < active.length; ++i)
+				this.offsets.push({
+					"ent": active[i],
+					"x": distributed[i].x - target.x,
+					"y": distributed[i].y - target.y
+				});
+		}
+		else if (sc.mode === "outlier_collapse")
+		{
+			// OUTLIER COLLAPSE: inliers keep full offsets, outliers get pulled inward.
+			this.offsets = this.ComputeFormationOffsets(active, positions);
+			for (let i = 0; i < this.offsets.length; ++i)
+			{
+				let entIdx = active.indexOf(this.offsets[i].ent);
+				if (sc.outliers.indexOf(entIdx) !== -1)
+				{
+					// Article formula: clamp outlier offset to 1 sigma, preserving direction.
+					let ox = this.offsets[i].x;
+					let oy = this.offsets[i].y;
+					let len = Math.sqrt(ox * ox + oy * oy);
+					if (len > 0)
+					{
+						this.offsets[i].x = (ox / len) * sc.sigma;
+						this.offsets[i].y = (oy / len) * sc.sigma;
+					}
+				}
+			}
+		}
+		else
+		{
+			// TIGHT: consistent full offsets.
+			this.offsets = this.ComputeFormationOffsets(active, positions);
+		}
+		offsetsChanged = true;
+	}
+
+	this.IssueFormationOrders(this.offsets, force, variant);
+};
+
+/**
+ * Helper to issue FormationWalk orders from a computed offsets array.
+ */
+Formation.prototype.IssueFormationOrders = function(offsets, force, variant)
+{
+	let xMax = 0;
+	let yMax = 0;
+	let xMin = 0;
+	let yMin = 0;
+
+	for (let i = 0; i < offsets.length; ++i)
+	{
+		let offset = offsets[i];
+		let cmpUnitAI = Engine.QueryInterface(offset.ent, IID_UnitAI);
+		if (!cmpUnitAI)
+			continue;
+
+		cmpUnitAI.AddOrder("FormationWalk", {
+			"target": this.entity,
+			"x": offset.x,
+			"z": offset.y,
+			"offsetsChanged": true,
+			"variant": variant
+		}, !force);
+
+		xMax = Math.max(xMax, offset.x);
+		yMax = Math.max(yMax, offset.y);
+		xMin = Math.min(xMin, offset.x);
+		yMin = Math.min(yMin, offset.y);
+	}
+	this.width = xMax - xMin;
+	this.depth = yMax - yMin;
+};
 
 Engine.RegisterComponentType(IID_Formation, "Formation", Formation);

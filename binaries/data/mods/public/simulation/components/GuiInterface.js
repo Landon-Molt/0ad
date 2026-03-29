@@ -2122,7 +2122,15 @@ GuiInterface.prototype.exposedFunctions = {
 	"IsTemplateModified": 1,
 	"ResetTemplateModified": 1,
 	"IsSelectionDirty": 1,
-	"ResetSelectionDirty": 1
+	"ResetSelectionDirty": 1,
+	"GetPathStats": 1
+};
+
+GuiInterface.prototype.GetPathStats = function()
+{
+	let cmpPathfinder = Engine.QueryInterface(SYSTEM_ENTITY, IID_Pathfinder);
+	let stats = cmpPathfinder.GetAndResetPathStats();
+	return { "longPaths": stats[0], "shortPaths": stats[1] };
 };
 
 GuiInterface.prototype.ScriptCall = function(player, name, args)

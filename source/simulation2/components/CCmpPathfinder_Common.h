@@ -36,6 +36,7 @@
 #include "simulation2/components/ICmpObstruction.h"
 #include "simulation2/components/ICmpPathfinder.h"
 #include "simulation2/helpers/Grid.h"
+#include "simulation2/helpers/FlowFieldManager.h"
 #include "simulation2/helpers/HierarchicalPathfinder.h"
 #include "simulation2/helpers/LongPathfinder.h"
 #include "simulation2/helpers/Pathfinding.h"
@@ -103,6 +104,7 @@ public:
 	std::vector<VertexPathfinder> m_VertexPathfinders;
 	std::unique_ptr<HierarchicalPathfinder> m_PathfinderHier;
 	std::unique_ptr<LongPathfinder> m_LongPathfinder;
+	std::unique_ptr<FlowFieldManager> m_FlowFieldManager;
 
 	// One per live asynchronous path computing task.
 	std::vector<Future<void>> m_Futures;
@@ -146,6 +148,10 @@ public:
 	PathRequests<ShortPathRequest> m_ShortPathRequests;
 
 	u32 m_NextAsyncTicket; // Unique IDs for asynchronous path requests.
+
+	// Path request counters for performance profiling.
+	u32 m_LongPathCount = 0;
+	u32 m_ShortPathCount = 0;
 
 	AtlasOverlay* m_AtlasOverlay;
 
@@ -231,6 +237,32 @@ public:
 	void SetAtlasOverlay(bool enable, pass_class_t passClass = 0) override;
 
 	std::vector<CFixedVector2D> DistributeAround(std::vector<entity_id_t> units, entity_pos_t x, entity_pos_t z) const override;
+
+	std::vector<CFixedVector2D> ComputeGroupPath(entity_pos_t x0, entity_pos_t z0, entity_pos_t x1, entity_pos_t z1, const std::string& passClassName) const override;
+
+	std::vector<u32> GetPathWidths(std::vector<CFixedVector2D> waypoints, const std::string& passClassName) const override;
+	std::vector<CFixedVector2D> GetPathSideWidths(std::vector<CFixedVector2D> waypoints, const std::string& passClassName) const override;
+
+	std::vector<u32> GetAndResetPathStats() override;
+
+	std::vector<CFixedVector2D> ComputeFlowFieldPath(entity_pos_t x0, entity_pos_t z0,
+		entity_pos_t x1, entity_pos_t z1, const std::string& passClassName) override;
+
+	u8 GetFlowDirection(entity_pos_t worldX, entity_pos_t worldZ, pass_class_t passClass) const override
+	{
+		if (m_FlowFieldManager)
+			return m_FlowFieldManager->GetFlowDirection(worldX, worldZ, passClass);
+		return 0;
+	}
+
+	CFixedVector2D GetSmoothFlowDirection(entity_pos_t worldX, entity_pos_t worldZ, pass_class_t passClass) const override
+	{
+		if (m_FlowFieldManager)
+			return m_FlowFieldManager->GetSmoothFlowDirection(worldX, worldZ, passClass);
+		return CFixedVector2D(fixed::Zero(), fixed::Zero());
+	}
+
+	std::vector<CFixedVector2D> GetEntityPositionsBatch(std::vector<entity_id_t> entities) const override;
 
 	bool CheckMovement(const IObstructionTestFilter& filter, entity_pos_t x0, entity_pos_t z0, entity_pos_t x1, entity_pos_t z1, entity_pos_t r, pass_class_t passClass) const override;
 

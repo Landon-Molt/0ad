@@ -91,9 +91,26 @@ public:
 		bool wentStraight = false;
 		bool wasObstructed = false;
 
+		// ORCA state (responsive mode only).
+		CFixedVector2D orcaVelocity;   // Collision-free velocity from ORCA solver
+		CFixedVector2D prefVelocity;   // Preferred velocity from flow field / waypoints
+
 		// Clone of the obstruction manager flag for efficiency
 		bool isMoving = false;
 	};
+
+	// Group movement mode: "classic" (default) or "responsive" (SC2-style).
+	std::string m_GroupMovementMode{"classic"};
+
+	void SetGroupMovementMode(const std::string& mode) override
+	{
+		m_GroupMovementMode = mode;
+	}
+
+	bool IsResponsiveMode() const override
+	{
+		return m_GroupMovementMode == "responsive";
+	}
 
 	// "Template" state, not serialized (cannot be changed mid-game).
 

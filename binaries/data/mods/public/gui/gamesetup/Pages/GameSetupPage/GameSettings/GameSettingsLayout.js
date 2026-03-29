@@ -45,6 +45,7 @@ var g_GameSettingsLayout = [
 			"RegicideGarrison",
 			"WonderDuration",
 			"GameSpeed",
+			"GroupMovement",
 			"Ceasefire",
 			"LockedTeams",
 			"LastManStanding",

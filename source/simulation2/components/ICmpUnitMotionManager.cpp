@@ -22,4 +22,5 @@
 #include "simulation2/system/InterfaceScripted.h"
 
 BEGIN_INTERFACE_WRAPPER(UnitMotionManager)
+DEFINE_INTERFACE_METHOD("SetGroupMovementMode", ICmpUnitMotionManager, SetGroupMovementMode)
 END_INTERFACE_WRAPPER(UnitMotionManager)
