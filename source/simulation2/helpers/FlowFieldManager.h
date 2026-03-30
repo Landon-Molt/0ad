@@ -83,10 +83,10 @@ struct FlowFieldSector
 	u16 integrationField[SECTOR_SIZE][SECTOR_SIZE];         // Dijkstra discrete
 	u8 flowField[SECTOR_SIZE][SECTOR_SIZE];                 // 8-direction discrete
 
-	// Eikonal continuous fields (smooth movement).
-	float eikonalField[SECTOR_SIZE][SECTOR_SIZE];           // Continuous travel time
-	CFixedVector2D smoothFlowField[SECTOR_SIZE][SECTOR_SIZE]; // Continuous gradient direction
-	bool hasEikonal = false;                                // Whether Eikonal was computed
+	// Eikonal continuous fields (smooth movement) — all fixed-point for determinism.
+	fixed eikonalField[SECTOR_SIZE][SECTOR_SIZE];              // Travel time (fixed-point)
+	CFixedVector2D smoothFlowField[SECTOR_SIZE][SECTOR_SIZE];  // Gradient direction
+	bool hasEikonal = false;
 
 	std::vector<u32> portalIds;
 
@@ -111,7 +111,7 @@ struct FlowFieldSector
 		for (int j = 0; j < SECTOR_SIZE; ++j)
 			for (int i = 0; i < SECTOR_SIZE; ++i)
 			{
-				eikonalField[j][i] = 1e30f;
+				eikonalField[j][i] = fixed::FromInt(30000); // "Infinity" in fixed-point
 				smoothFlowField[j][i] = CFixedVector2D(fixed::Zero(), fixed::Zero());
 			}
 		hasEikonal = false;
@@ -128,6 +128,14 @@ struct FlowFieldCacheKey
 	{
 		return portalId == o.portalId && sectorX == o.sectorX &&
 			sectorY == o.sectorY && passClass == o.passClass;
+	}
+
+	bool operator<(const FlowFieldCacheKey& o) const
+	{
+		if (sectorX != o.sectorX) return sectorX < o.sectorX;
+		if (sectorY != o.sectorY) return sectorY < o.sectorY;
+		if (passClass != o.passClass) return passClass < o.passClass;
+		return portalId < o.portalId;
 	}
 };
 
@@ -230,8 +238,8 @@ private:
 	// Portal adjacency for A*: portalId -> list of (connected portalId, cost)
 	std::map<u32, std::vector<std::pair<u32, fixed>>> m_PortalGraph;
 
-	// Cached flow fields
-	std::unordered_map<FlowFieldCacheKey, FlowFieldSector, FlowFieldCacheKeyHash> m_FlowFieldCache;
+	// Cached flow fields — use ordered map for deterministic iteration across platforms.
+	std::map<FlowFieldCacheKey, FlowFieldSector> m_FlowFieldCache;
 };
 
 #endif // INCLUDED_FLOWFIELDMANAGER

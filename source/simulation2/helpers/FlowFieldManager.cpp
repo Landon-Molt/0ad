@@ -335,46 +335,23 @@ void FlowFieldManager::GenerateFlowFieldEikonal(u16 sectorX, u16 sectorY,
 	FlowFieldSector& sector = GetSector(sectorX, sectorY);
 	sector.ResetEikonal();
 
-	// Fast Marching Method (FMM) for Eikonal equation |∇T| = f(x).
-	// T = travel time, f = cost. Produces a continuous distance field.
-	// Uses float for intermediate computation, converts to fixed at the end.
-
-	// Priority queue: (travel time, cellIndex)
-	using FMMEntry = std::pair<float, u16>;
-	std::priority_queue<FMMEntry, std::vector<FMMEntry>, std::greater<FMMEntry>> narrow;
-
-	// Status: 0 = far, 1 = narrow band, 2 = frozen
-	u8 status[SECTOR_SIZE][SECTOR_SIZE] = {};
-
-	// Initialize goal cells.
-	for (auto& [gi, gj] : goalCells)
-	{
-		if (gi < SECTOR_SIZE && gj < SECTOR_SIZE && sector.costField[gj][gi] != COST_IMPASSABLE)
-		{
-			sector.eikonalField[gj][gi] = 0.0f;
-			status[gj][gi] = 2; // Frozen
-			// Add neighbors to narrow band.
-			for (int d = 1; d <= 4; ++d) // 4-connected for FMM (N,E,S,W)
-			{
-				int ni = gi + DX[d * 2 - 1]; // N=1, E=3, S=5, W=7 → use cardinal only
-				int nj = gj + DZ[d * 2 - 1];
-				// Use proper cardinal indices: N=1, E=3, S=5, W=7
-			}
-		}
-	}
-
-	// Proper 4-connected cardinal directions for FMM.
-	static const int CDX[] = { 0, 1, 0, -1 }; // E, S, W, N... no, let's be explicit:
-	// Right(+x), Up(-z), Left(-x), Down(+z) — but grid is [j][i] where i=x, j=z
+	// Fast Marching Method — fully fixed-point for cross-platform determinism.
+	static const fixed FP_INF = fixed::FromInt(30000);
 	static const int FMM_DX[] = { 1, -1, 0, 0 };
 	static const int FMM_DZ[] = { 0, 0, 1, -1 };
 
-	// Re-initialize: seed goal cells and push neighbors.
+	// Priority queue: (travel time, cellIndex)
+	using FMMEntry = std::pair<fixed, u16>;
+	std::priority_queue<FMMEntry, std::vector<FMMEntry>, std::greater<FMMEntry>> narrow;
+
+	u8 status[SECTOR_SIZE][SECTOR_SIZE] = {}; // 0=far, 1=narrow, 2=frozen
+
+	// Seed goal cells.
 	for (auto& [gi, gj] : goalCells)
 	{
 		if (gi >= SECTOR_SIZE || gj >= SECTOR_SIZE || sector.costField[gj][gi] == COST_IMPASSABLE)
 			continue;
-		sector.eikonalField[gj][gi] = 0.0f;
+		sector.eikonalField[gj][gi] = fixed::Zero();
 		status[gj][gi] = 2;
 
 		for (int d = 0; d < 4; ++d)
@@ -386,12 +363,10 @@ void FlowFieldManager::GenerateFlowFieldEikonal(u16 sectorX, u16 sectorY,
 			if (sector.costField[nj][ni] == COST_IMPASSABLE || status[nj][ni] != 0)
 				continue;
 
-			// Solve Eikonal for this cell.
-			float cost = (float)sector.costField[nj][ni];
-			// Simple 1D case: T = T_neighbor + cost
-			sector.eikonalField[nj][ni] = sector.eikonalField[gj][gi] + cost;
+			fixed cost = fixed::FromInt(sector.costField[nj][ni]);
+			sector.eikonalField[nj][ni] = cost;
 			status[nj][ni] = 1;
-			narrow.push({sector.eikonalField[nj][ni], (u16)(nj * SECTOR_SIZE + ni)});
+			narrow.push({cost, (u16)(nj * SECTOR_SIZE + ni)});
 		}
 	}
 
@@ -405,12 +380,11 @@ void FlowFieldManager::GenerateFlowFieldEikonal(u16 sectorX, u16 sectorY,
 		u16 cj = idx / SECTOR_SIZE;
 
 		if (status[cj][ci] == 2)
-			continue; // Already frozen.
+			continue;
 
-		status[cj][ci] = 2; // Freeze this cell.
+		status[cj][ci] = 2;
 		sector.eikonalField[cj][ci] = t;
 
-		// Update 4-connected neighbors.
 		for (int d = 0; d < 4; ++d)
 		{
 			int ni = ci + FMM_DX[d];
@@ -420,41 +394,36 @@ void FlowFieldManager::GenerateFlowFieldEikonal(u16 sectorX, u16 sectorY,
 			if (sector.costField[nj][ni] == COST_IMPASSABLE || status[nj][ni] == 2)
 				continue;
 
-			float cost = (float)sector.costField[nj][ni];
+			fixed cost = fixed::FromInt(sector.costField[nj][ni]);
 
-			// Solve the Eikonal equation using the two-axis upwind scheme:
-			// max((T - Tx)^2, 0) + max((T - Tz)^2, 0) = cost^2
-			// where Tx = min(T_left, T_right), Tz = min(T_up, T_down)
-			float Tx = 1e30f, Tz = 1e30f;
+			// Eikonal upwind scheme: min frozen neighbor per axis.
+			fixed Tx = FP_INF, Tz = FP_INF;
 
-			// Horizontal axis (x neighbors).
 			if (ni > 0 && status[nj][ni - 1] == 2)
 				Tx = std::min(Tx, sector.eikonalField[nj][ni - 1]);
 			if (ni + 1 < SECTOR_SIZE && status[nj][ni + 1] == 2)
 				Tx = std::min(Tx, sector.eikonalField[nj][ni + 1]);
-
-			// Vertical axis (z neighbors).
 			if (nj > 0 && status[nj - 1][ni] == 2)
 				Tz = std::min(Tz, sector.eikonalField[nj - 1][ni]);
 			if (nj + 1 < SECTOR_SIZE && status[nj + 1][ni] == 2)
 				Tz = std::min(Tz, sector.eikonalField[nj + 1][ni]);
 
-			float newT;
-			if (Tx > 1e20f && Tz > 1e20f)
-				continue; // No frozen neighbors — shouldn't happen in normal FMM.
-			else if (Tx > 1e20f)
-				newT = Tz + cost; // Only vertical neighbor available.
-			else if (Tz > 1e20f)
-				newT = Tx + cost; // Only horizontal neighbor available.
+			fixed newT;
+			if (Tx >= FP_INF && Tz >= FP_INF)
+				continue;
+			else if (Tx >= FP_INF)
+				newT = Tz + cost;
+			else if (Tz >= FP_INF)
+				newT = Tx + cost;
 			else
 			{
-				// Full 2D Eikonal solve: (T-Tx)^2 + (T-Tz)^2 = cost^2
-				float diff = Tx - Tz;
-				float disc = 2.0f * cost * cost - diff * diff;
-				if (disc >= 0.0f)
-					newT = (Tx + Tz + sqrtf(disc)) / 2.0f;
+				// 2D Eikonal: (T-Tx)^2 + (T-Tz)^2 = cost^2
+				fixed diff = Tx - Tz;
+				fixed disc = cost.Multiply(cost) * 2 - diff.Multiply(diff);
+				if (disc >= fixed::Zero())
+					newT = (Tx + Tz + disc.Sqrt()) / fixed::FromInt(2);
 				else
-					newT = std::min(Tx, Tz) + cost; // Fallback to 1D.
+					newT = std::min(Tx, Tz) + cost;
 			}
 
 			if (newT < sector.eikonalField[nj][ni])
@@ -466,55 +435,42 @@ void FlowFieldManager::GenerateFlowFieldEikonal(u16 sectorX, u16 sectorY,
 		}
 	}
 
-	// Step 2: Compute smooth gradient from the continuous Eikonal field.
-	// Gradient = -∇T (points toward decreasing travel time = toward goal).
+	// Gradient: -∇T using central differences, all fixed-point.
 	for (int j = 0; j < SECTOR_SIZE; ++j)
 	{
 		for (int i = 0; i < SECTOR_SIZE; ++i)
 		{
-			if (sector.costField[j][i] == COST_IMPASSABLE || sector.eikonalField[j][i] > 1e20f)
+			if (sector.costField[j][i] == COST_IMPASSABLE || sector.eikonalField[j][i] >= FP_INF)
 				continue;
 
-			// Central differences for gradient.
-			float dTdx = 0.0f, dTdz = 0.0f;
+			fixed dTdx = fixed::Zero(), dTdz = fixed::Zero();
 
 			if (i > 0 && i + 1 < SECTOR_SIZE &&
-				sector.eikonalField[j][i - 1] < 1e20f && sector.eikonalField[j][i + 1] < 1e20f)
-				dTdx = (sector.eikonalField[j][i + 1] - sector.eikonalField[j][i - 1]) / 2.0f;
-			else if (i > 0 && sector.eikonalField[j][i - 1] < 1e20f)
+				sector.eikonalField[j][i - 1] < FP_INF && sector.eikonalField[j][i + 1] < FP_INF)
+				dTdx = (sector.eikonalField[j][i + 1] - sector.eikonalField[j][i - 1]) / fixed::FromInt(2);
+			else if (i > 0 && sector.eikonalField[j][i - 1] < FP_INF)
 				dTdx = sector.eikonalField[j][i] - sector.eikonalField[j][i - 1];
-			else if (i + 1 < SECTOR_SIZE && sector.eikonalField[j][i + 1] < 1e20f)
+			else if (i + 1 < SECTOR_SIZE && sector.eikonalField[j][i + 1] < FP_INF)
 				dTdx = sector.eikonalField[j][i + 1] - sector.eikonalField[j][i];
 
 			if (j > 0 && j + 1 < SECTOR_SIZE &&
-				sector.eikonalField[j - 1][i] < 1e20f && sector.eikonalField[j + 1][i] < 1e20f)
-				dTdz = (sector.eikonalField[j + 1][i] - sector.eikonalField[j - 1][i]) / 2.0f;
-			else if (j > 0 && sector.eikonalField[j - 1][i] < 1e20f)
+				sector.eikonalField[j - 1][i] < FP_INF && sector.eikonalField[j + 1][i] < FP_INF)
+				dTdz = (sector.eikonalField[j + 1][i] - sector.eikonalField[j - 1][i]) / fixed::FromInt(2);
+			else if (j > 0 && sector.eikonalField[j - 1][i] < FP_INF)
 				dTdz = sector.eikonalField[j][i] - sector.eikonalField[j - 1][i];
-			else if (j + 1 < SECTOR_SIZE && sector.eikonalField[j + 1][i] < 1e20f)
+			else if (j + 1 < SECTOR_SIZE && sector.eikonalField[j + 1][i] < FP_INF)
 				dTdz = sector.eikonalField[j + 1][i] - sector.eikonalField[j][i];
 
-			// Negate gradient (we want to move TOWARD goal = decreasing T).
-			float gx = -dTdx;
-			float gz = -dTdz;
-
-			// Normalize.
-			float len = sqrtf(gx * gx + gz * gz);
-			if (len > 0.001f)
-			{
-				gx /= len;
-				gz /= len;
-			}
-
-			// Convert to fixed-point.
-			sector.smoothFlowField[j][i] = CFixedVector2D(
-				fixed::FromFloat(gx), fixed::FromFloat(gz));
+			// Negate gradient and normalize using deterministic Length()/Sqrt().
+			CFixedVector2D grad(-dTdx, -dTdz);
+			fixed len = grad.Length();
+			if (len > fixed::Epsilon())
+				sector.smoothFlowField[j][i] = CFixedVector2D(grad.X / len, grad.Y / len);
 		}
 	}
 
 	sector.hasEikonal = true;
 
-	// Update cache with Eikonal data.
 	FlowFieldCacheKey key{portalId, sectorX, sectorY, passClass};
 	m_FlowFieldCache[key] = sector;
 }

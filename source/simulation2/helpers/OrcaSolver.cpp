@@ -145,7 +145,8 @@ bool OrcaSolver::LinearProgram1(
 		return false; // Max speed circle fully on the wrong side.
 
 	// Approximate sqrt for fixed point.
-	fixed sqrtDisc = discriminant.IsZero() ? fixed::Zero() : fixed::FromFloat(sqrtf(discriminant.ToFloat()));
+	// Use the engine's deterministic fixed-point sqrt (isqrt64 — bit-exact cross-platform).
+	fixed sqrtDisc = discriminant.Sqrt();
 
 	fixed tLeft = -dotProduct - sqrtDisc;
 	fixed tRight = -dotProduct + sqrtDisc;

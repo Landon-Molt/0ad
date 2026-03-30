@@ -503,6 +503,9 @@ void CCmpUnitMotionManager::Move(EntityMap<MotionState>& ents, fixed dt)
 				it->second.cmpUnitMotion->Move(it->second, dt);
 			// Decay pressure after moving so we can get the full 0-MAX_PRESSURE range of values.
 			it->second.pushingPressure = (m_PushingPressureDecay * it->second.pushingPressure).ToInt_RoundToZero();
+			// Reset ORCA state every tick — these are transient per-tick values.
+			it->second.orcaVelocity = CFixedVector2D();
+			it->second.prefVelocity = CFixedVector2D();
 		}
 	}
 
